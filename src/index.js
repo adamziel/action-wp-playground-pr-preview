@@ -204,6 +204,15 @@ const githubLib = require('@actions/github');
   	  ? values[upperKey]
   	  : '';
 
+      // Character references keep PR and repository text from becoming Markdown
+      // or HTML syntax. Encode spaces too, so values cannot indent code blocks.
+      if (/^(PR_|REPO_)/.test(upperKey)) {
+        return value.replace(/[\r\n\t]+/g, ' ').replace(
+          /[\u0020-\u002f\u003a-\u0040\u005b-\u0060\u007b-\u007e]/g,
+          character => `&#${character.charCodeAt(0)};`
+        );
+      }
+
   	// Escape HTML entities somewhat naively to prevent the values leaking
   	// into HTML syntax elements.
 	  if (upperKey !== 'PLAYGROUND_BUTTON') {

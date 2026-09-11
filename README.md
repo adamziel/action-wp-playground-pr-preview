@@ -707,7 +707,7 @@ Available in `description-template` and `comment-template` strings (case-insensi
 | `PLUGIN_PATH`, `PLUGIN_SLUG` | Set when `plugin-path:` is provided. |
 | `THEME_PATH`, `THEME_SLUG` | Set when `theme-path:` is provided. |
 
-All variables except `PLAYGROUND_BUTTON` are HTML-escaped before substitution.
+`PR_*` and `REPO_*` values are inserted as text: spaces and punctuation are encoded as character references and line breaks become spaces, so a PR title such as `[text](url)` stays literal rather than becoming a link. Use these placeholders in normal Markdown text or HTML, not inside Markdown code spans or fenced code blocks, which display character references verbatim. Templates still control their own links and formatting. Other values remain HTML-escaped, except `PLAYGROUND_BUTTON`, which contains the generated button HTML.
 
 ---
 
