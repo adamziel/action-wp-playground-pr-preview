@@ -144,7 +144,11 @@ jobs:
             const a = artifacts[0];
             const m = a.name.match(/^wp-playground-preview-pr(\d+)-(.+)$/);
             if (!m) throw new Error(`Cannot parse artifact name: ${a.name}`);
-            const [, prNumber, commitSha] = m;
+            const [, rawPrNumber, commitSha] = m;
+            const prNumber = Number(rawPrNumber);
+            if (!Number.isSafeInteger(prNumber) || prNumber < 1) {
+              throw new Error('Artifact PR number must be a positive safe integer.');
+            }
             const expectedSha = context.payload.workflow_run.head_sha;
             if (commitSha !== expectedSha) {
               throw new Error(`Artifact SHA ${commitSha} does not match source workflow_run.head_sha ${expectedSha}.`);
@@ -156,14 +160,14 @@ jobs:
             const prResponse = await github.rest.pulls.get({
               owner: context.repo.owner,
               repo: context.repo.repo,
-              pull_number: Number(prNumber),
+              pull_number: prNumber,
             });
             if (prResponse.data.head.sha !== expectedSha) {
               throw new Error(`Artifact PR number ${prNumber} points to head SHA ${prResponse.data.head.sha}, not workflow_run.head_sha ${expectedSha}.`);
             }
             core.setOutput('artifact-id', String(a.id));
             core.setOutput('artifact-name', a.name);
-            core.setOutput('pr-number', prNumber);
+            core.setOutput('pr-number', String(prNumber));
             core.setOutput('commit-sha', commitSha);
 
       - name: Download artifact bundle

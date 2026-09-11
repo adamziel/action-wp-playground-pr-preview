@@ -3,6 +3,7 @@ import { spawnSync } from 'node:child_process';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import './test-publish-metadata.mjs';
 
 const publishWorkflow = readFileSync(
   new URL('../.github/workflows/preview-publish.yml', import.meta.url),
@@ -38,7 +39,7 @@ test('publish workflow validates the untrusted artifact name against workflow_ru
   assert.match(publishWorkflow, /context\.payload\.workflow_run\.head_sha/);
   assert.match(publishWorkflow, /commitSha !== expectedSha/);
   assert.match(publishWorkflow, /github\.rest\.pulls\.get/);
-  assert.match(publishWorkflow, /pull_number: Number\(prNumber\)/);
+  assert.match(publishWorkflow, /pull_number: prNumber/);
   assert.match(publishWorkflow, /prResponse\.data\.head\.sha !== expectedSha/);
 });
 
