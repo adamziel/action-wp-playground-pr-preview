@@ -1,5 +1,8 @@
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
+import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
 const publishWorkflow = readFileSync(
   new URL('../.github/workflows/preview-publish.yml', import.meta.url),
@@ -37,6 +40,54 @@ test('publish workflow validates the untrusted artifact name against workflow_ru
   assert.match(publishWorkflow, /github\.rest\.pulls\.get/);
   assert.match(publishWorkflow, /pull_number: Number\(prNumber\)/);
   assert.match(publishWorkflow, /prResponse\.data\.head\.sha !== expectedSha/);
+});
+
+test('publish workflow rejects link entries before extracting a bundle', () => {
+  const extractStep = publishWorkflow.match(
+    /- name: Extract artifact bundle[\s\S]*?python3 <<'PY'\n([\s\S]*?)\n\s+PY/
+  );
+  assert.ok(extractStep, 'Extract artifact bundle step not found');
+  const extractScript = extractStep[1].replace(/^ {10}/gm, '');
+  const directory = mkdtempSync(join(tmpdir(), 'preview-bundle-'));
+
+  try {
+    const fixture = spawnSync('python3', ['-c', `
+from zipfile import ZipFile, ZipInfo
+
+entry = ZipInfo('zips/preview.zip')
+entry.create_system = 3
+entry.external_attr = 0o120777 << 16
+with ZipFile('bundle.zip', 'w') as archive:
+    archive.writestr(entry, '/tmp/outside.zip')
+`], { cwd: directory, encoding: 'utf8' });
+    assert.equal(fixture.status, 0, fixture.stderr);
+
+    const result = spawnSync('python3', ['-c', extractScript], {
+      cwd: directory,
+      encoding: 'utf8',
+    });
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /must be a regular file or directory/);
+    assert.equal(existsSync(join(directory, 'bundle')), false);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('publish workflow stages bundle files before the token-bearing upload step', () => {
+  const prepareStep = publishWorkflow.match(
+    /- name: Prepare release assets[\s\S]*?(?=\n\s+- name: Ensure release exists)/
+  )?.[0];
+  const uploadStep = publishWorkflow.match(
+    /- name: Upload zips and resolve URLs[\s\S]*?(?=\n\s+- name: Render blueprint)/
+  )?.[0];
+  assert.ok(prepareStep, 'Prepare release assets step not found');
+  assert.ok(uploadStep, 'Upload zips and resolve URLs step not found');
+  assert.doesNotMatch(prepareStep, /GH_TOKEN/);
+  assert.match(prepareStep, /cp -- "\$src" "release-assets\/\$asset"/);
+  assert.match(uploadStep, /GH_TOKEN/);
+  assert.match(uploadStep, /staged="release-assets\/\$asset"/);
+  assert.doesNotMatch(uploadStep, /bundle\/zips/);
 });
 
 test('release cleanup failures fail the workflow instead of being swallowed', () => {
