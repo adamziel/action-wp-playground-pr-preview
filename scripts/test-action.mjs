@@ -1,0 +1,114 @@
+import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
+import test from 'node:test';
+import { runInNewContext } from 'node:vm';
+
+const source = readFileSync(new URL('../src/index.js', import.meta.url), 'utf8');
+const marker = '<!-- wp-playground-preview-comment -->';
+
+test('comment mode skips an earlier marker from another author', async () => {
+  const result = await runAction({ comments: [
+    { id: 10, user: { id: 202, type: 'User' }, body: marker },
+    { id: 20, user: { id: 101, type: 'Bot' }, body: marker },
+  ] });
+  assert.deepEqual(result.errors, []);
+  assert.deepEqual(result.calls.filter(call => call.method === 'updateComment').map(call => call.comment_id), [20]);
+  assert.equal(result.outputs['comment-id'], '20');
+  assert.equal(result.calls.filter(call => call.method === 'createComment').length, 0);
+});
+
+for (const user of [{ id: 202, type: 'User' }, { id: 303, type: 'Bot' }, null]) {
+  test(`comment mode creates a comment instead of changing a marker from ${user?.type || 'an unknown author'}`, async () => {
+    const result = await runAction({ comments: [{ id: 10, user, body: marker }] });
+    assert.deepEqual(result.errors, []);
+    assert.equal(result.calls.filter(call => call.method === 'updateComment').length, 0);
+    assert.equal(result.calls.filter(call => call.method === 'createComment').length, 1);
+    assert.equal(result.outputs['comment-id'], '99');
+  });
+}
+
+test('comment mode also matches the account behind a personal token', async () => {
+  const result = await runAction({ viewerId: 202, comments: [
+    { id: 10, user: { id: 101, type: 'Bot' }, body: marker },
+    { id: 20, user: { id: 202, type: 'User' }, body: marker },
+  ] });
+  assert.deepEqual(result.errors, []);
+  assert.equal(result.outputs['comment-id'], '20');
+});
+
+test('matching authors still need the preview marker', async () => {
+  const result = await runAction({ comments: [{ id: 10, user: { id: 101 }, body: 'Unrelated comment' }] });
+  assert.equal(result.outputs['comment-id'], '99');
+  assert.equal(result.calls.filter(call => call.method === 'updateComment').length, 0);
+});
+
+test('an unchanged preview comment is reused without an update', async () => {
+  const first = await runAction();
+  const body = first.calls.find(call => call.method === 'createComment').body;
+  const result = await runAction({ comments: [{ id: 20, user: { id: 101 }, body }] });
+  assert.deepEqual(result.errors, []);
+  assert.equal(result.outputs['comment-id'], '20');
+  assert.equal(result.calls.filter(call => ['createComment', 'updateComment'].includes(call.method)).length, 0);
+});
+
+for (const viewerId of [null, undefined, 0, '101']) {
+  test(`comment mode stops without writes when the token account ID is ${viewerId}`, async () => {
+    const result = await runAction({ viewerId, body: '<!-- wp-playground-preview:start -->old<!-- wp-playground-preview:end -->' });
+    assert.match(result.errors.join('\n'), /determine the comment author/);
+    assert.equal(result.calls.filter(call => ['createComment', 'updateComment', 'updatePull'].includes(call.method)).length, 0);
+  });
+}
+
+test('a failed token account lookup stops comment updates', async () => {
+  const result = await runAction({ viewerError: new Error('Lookup failed') });
+  assert.match(result.errors.join('\n'), /Lookup failed/);
+  assert.equal(result.calls.filter(call => ['createComment', 'updateComment'].includes(call.method)).length, 0);
+});
+
+test('description mode does not need a comment author lookup', async () => {
+  const result = await runAction({ inputs: { mode: 'append-to-description' }, viewerError: new Error('Not used') });
+  assert.deepEqual(result.errors, []);
+  assert.equal(result.calls.filter(call => call.method === 'graphql').length, 0);
+  assert.equal(result.calls.filter(call => call.method === 'updatePull').length, 1);
+});
+
+async function runAction(options = {}) {
+  const { comments = [], inputs = {}, body = '', viewerError } = options;
+  const viewerId = Object.hasOwn(options, 'viewerId') ? options.viewerId : 101;
+  const calls = [];
+  const outputs = {};
+  const errors = [];
+  const record = (method, args) => calls.push({ method, ...JSON.parse(JSON.stringify(args)) });
+  const github = {
+    graphql: async query => {
+      record('graphql', { query });
+      if (viewerError) throw viewerError;
+      return { viewer: { databaseId: viewerId } };
+    },
+    paginate: async (method, args) => { record('listComments', args); return comments; },
+    rest: {
+      issues: {
+        listComments() {},
+        updateComment: async args => { record('updateComment', args); },
+        createComment: async args => { record('createComment', args); return { data: { id: 99 } }; },
+      },
+      pulls: { update: async args => { record('updatePull', args); } },
+    },
+  };
+  const core = {
+    getInput: name => ({ 'github-token': 'test-token', mode: 'comment', 'plugin-path': '.', ...inputs })[name] || '',
+    info() {}, warning() {},
+    setOutput: (name, value) => { outputs[name] = value; },
+    setFailed: message => { errors.push(message); },
+  };
+  const context = { payload: {
+    repository: { owner: { login: 'example' }, name: 'plugin', full_name: 'example/plugin' },
+    pull_request: { number: 7, title: 'Add a setting', body, head: { ref: 'feature', sha: 'a'.repeat(40) }, base: { ref: 'main' } },
+  } };
+  await runInNewContext(source, { require: name => {
+    if (name === '@actions/core') return core;
+    if (name === '@actions/github') return { context, getOctokit: () => github };
+    throw new Error(`Unexpected module: ${name}`);
+  } });
+  return { calls, outputs, errors };
+}

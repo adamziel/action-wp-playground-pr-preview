@@ -478,6 +478,8 @@ The important connection is the artifact name. `artifacts: my-plugin=...` in the
 
 In the build-step setup, pass `mode: comment` to `preview-publish.yml` instead.
 
+Comment mode reuses a preview comment only when its marker and author match the account behind `github-token`. A marker in someone else's comment is ignored. Changing the token to a different account creates a new preview comment; it does not edit the previous account's comment.
+
 ### Customize the button text or add testing instructions
 
 ```yaml

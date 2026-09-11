@@ -4,6 +4,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, 
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import './test-publish-metadata.mjs';
+import './test-action.mjs';
 
 const publishWorkflow = readFileSync(
   new URL('../.github/workflows/preview-publish.yml', import.meta.url),
