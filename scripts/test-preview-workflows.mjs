@@ -259,6 +259,16 @@ for (const [label, overrides, message] of [
   ['malformed run SHA', { TEST_RUN_SHA: 'not-a-sha', COMMIT_SHA: 'not-a-sha', TEST_PR_SHA: 'not-a-sha' }, /commit-sha does not match source run/],
   ['missing PR head SHA', { TEST_PR_SHA: '' }, /PR #17 head SHA does not match/],
   ['short commit SHA', { COMMIT_SHA: 'abc123' }, /commit-sha does not match source run/],
+  ['same commit in another fork', { TEST_PR_HEAD_REPO: 'other/fork' }, /head repository does not match/],
+  ['same commit on another branch', { TEST_PR_HEAD_REF: 'other-branch' }, /head branch does not match/],
+  ['non-PR source run', { TEST_RUN_EVENT: 'push' }, /must be a pull_request run/],
+  ['missing head repository', { TEST_RUN_HEAD_REPO: '' }, /head repository does not match/],
+  ['missing head branch', { TEST_RUN_HEAD_REF: '' }, /head branch does not match/],
+  ['run listing another PR', { TEST_RUN_PULL_REQUESTS: '[{"number":18}]' }, /must identify exactly PR #17/],
+  ['run listing multiple PRs', { TEST_RUN_PULL_REQUESTS: '[{"number":17},{"number":18}]' }, /must identify exactly PR #17/],
+  ['branch shared by multiple PRs', { TEST_BRANCH_PR_NUMBERS: '[17,18]' }, /must identify exactly PR #17/],
+  ['branch with no matching PR', { TEST_BRANCH_PR_NUMBERS: '[]' }, /must identify exactly PR #17/],
+  ['failed branch lookup', { TEST_BRANCH_API_STATUS: '1' }, /Branch lookup failed/],
   ['zero PR number', { PR_NUMBER: '0' }, /must be positive integers/],
   ['negative PR number', { PR_NUMBER: '-17' }, /must be positive integers/],
   ['PR path instead of a number', { PR_NUMBER: '17/../../actions/runs/123' }, /must be positive integers/],
@@ -292,10 +302,11 @@ for (const repository of ['', 'example/source', 'other/builds']) {
       const sourceRepo = repository || env.GITHUB_REPOSITORY;
       const calls = readFileSync(env.TEST_GH_CALLS, 'utf8').trim().split('\n');
       assert.deepEqual(calls.slice(0, 2), [
-        `api /repos/${sourceRepo}/actions/runs/123 --jq .head_sha`,
-        `api /repos/${sourceRepo}/pulls/17 --jq .head.sha`,
+        `api /repos/${sourceRepo}/actions/runs/123`,
+        `api /repos/${sourceRepo}/pulls/17`,
       ]);
-      assert.ok(calls[2].startsWith(`api /repos/${sourceRepo}/actions/runs/123/artifacts `));
+      assert.equal(calls[2], `api /repos/${sourceRepo}/pulls --method GET -f head=contributor:preview -f state=all -f per_page=100 --paginate --slurp`);
+      assert.ok(calls[3].startsWith(`api /repos/${sourceRepo}/actions/runs/123/artifacts `));
       assert.ok(calls.includes(`release upload ci-artifacts ${env.ARTIFACT_DIRECTORY}/pr-17-${env.COMMIT_SHA}.zip --repo example/releases --clobber`));
       assert.deepEqual(calls.filter(call => call.startsWith('release delete-asset ')), [
         'release delete-asset ci-artifacts pr-17-old.zip --repo example/releases --yes',
@@ -304,6 +315,16 @@ for (const repository of ['', 'example/source', 'other/builds']) {
     });
   });
 }
+
+test('legacy helper uses the PR number attached to the source run when available', () => {
+  withLegacyArtifact([{ name: 'plugin.zip' }], ({ run, env }) => {
+    env.TEST_RUN_PULL_REQUESTS = '[{"number":17}]';
+    env.TEST_BRANCH_API_STATUS = '1';
+    const result = runLegacyPublication(run);
+    assert.equal(result.status, 0, result.stderr);
+    assert.doesNotMatch(readFileSync(env.TEST_GH_CALLS, 'utf8'), /\/pulls --method/);
+  });
+});
 
 test('legacy source checks receive the same PR and commit inputs used for upload and cleanup', () => {
   const downloadStep = exposeArtifactAction.match(/- name: Download build artifact from workflow run[\s\S]*?(?=\n    - name:)/)?.[0];
@@ -350,6 +371,17 @@ function withLegacyArtifact(entries, fn, filename = 'plugin.zip') {
     TEST_PR_SHA: 'a'.repeat(40),
     TEST_RUN_API_STATUS: '0',
     TEST_PR_API_STATUS: '0',
+    TEST_RUN_EVENT: 'pull_request',
+    TEST_RUN_HEAD_REPO: 'contributor/fork',
+    TEST_PR_HEAD_REPO: 'contributor/fork',
+    TEST_RUN_HEAD_REF: 'preview',
+    TEST_PR_HEAD_REF: 'preview',
+    TEST_RUN_PULL_REQUESTS: '[]',
+    TEST_BRANCH_PR_NUMBERS: '[17]',
+    TEST_BRANCH_API_STATUS: '0',
+    TEST_RUN_JSON: join(directory, 'run.json'),
+    TEST_PR_JSON: join(directory, 'pr.json'),
+    TEST_BRANCH_JSON: join(directory, 'branch.json'),
     TEST_GH_CALLS: join(directory, 'gh-calls'),
     TEST_ARCHIVE: join(directory, 'fixture.zip'),
     TEST_UPLOAD: join(directory, 'uploaded.zip'),
@@ -371,19 +403,25 @@ printf '%s\\n' "$*" >> "$TEST_GH_CALLS"
 if [[ "$2" == */actions/runs/*/artifacts ]]; then
   echo 456
 elif [[ "$2" == */actions/runs/* ]]; then
-  [ "$3 $4" = '--jq .head_sha' ]
+  [ "$#" -eq 2 ]
   if [ "$TEST_RUN_API_STATUS" != 0 ]; then
     echo 'Run lookup failed' >&2
     exit "$TEST_RUN_API_STATUS"
   fi
-  printf '%s\\n' "$TEST_RUN_SHA"
+  cat "$TEST_RUN_JSON"
 elif [[ "$2" == */pulls/* ]]; then
-  [ "$3 $4" = '--jq .head.sha' ]
+  [ "$#" -eq 2 ]
   if [ "$TEST_PR_API_STATUS" != 0 ]; then
     echo 'PR lookup failed' >&2
     exit "$TEST_PR_API_STATUS"
   fi
-  printf '%s\\n' "$TEST_PR_SHA"
+  cat "$TEST_PR_JSON"
+elif [[ "$2" == */pulls ]]; then
+  if [ "$TEST_BRANCH_API_STATUS" != 0 ]; then
+    echo 'Branch lookup failed' >&2
+    exit "$TEST_BRANCH_API_STATUS"
+  fi
+  cat "$TEST_BRANCH_JSON"
 elif [[ "$*" == *"/actions/artifacts/"* ]]; then
   cat "$TEST_ARCHIVE"
 elif [ "$1 $2" = "release upload" ]; then
@@ -417,6 +455,16 @@ with ZipFile(os.environ['TEST_ARCHIVE'], 'w') as archive:
     assert.equal(fixture.status, 0, fixture.stderr);
 
     const run = (name) => {
+      const head = { sha: env.TEST_PR_SHA, ref: env.TEST_PR_HEAD_REF, repo: { full_name: env.TEST_PR_HEAD_REPO } };
+      writeFileSync(env.TEST_RUN_JSON, JSON.stringify({
+        head_sha: env.TEST_RUN_SHA, event: env.TEST_RUN_EVENT, head_branch: env.TEST_RUN_HEAD_REF,
+        head_repository: { full_name: env.TEST_RUN_HEAD_REPO, owner: { login: env.TEST_RUN_HEAD_REPO.split('/')[0] } },
+        pull_requests: JSON.parse(env.TEST_RUN_PULL_REQUESTS),
+      }));
+      writeFileSync(env.TEST_PR_JSON, JSON.stringify({ number: Number(env.PR_NUMBER), head }));
+      writeFileSync(env.TEST_BRANCH_JSON, JSON.stringify([
+        JSON.parse(env.TEST_BRANCH_PR_NUMBERS).map(number => ({ number, head })),
+      ]));
       const step = exposeArtifactAction.match(new RegExp(`    - name: ${name}\\n([\\s\\S]*?)(?=\\n    - name: |$)`));
       assert.ok(step, `${name} step not found`);
       const script = step[1].match(/      run: (?:\|\n([\s\S]*)|([^\n]+))/);
