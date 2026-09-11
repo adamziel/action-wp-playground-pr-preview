@@ -12,21 +12,21 @@ inputs:
     default: plugin.zip
 
   artifact-source-run-id:
-    description: 'Workflow run ID that produced the artifact (defaults to current workflow run)'
+    description: 'Workflow run ID that produced the artifact; when set, its head SHA and the current PR head must match commit-sha (defaults to current workflow run)'
     required: false
     default: ''
 
   artifact-source-repository:
-    description: 'Owner/name of the repository that contains the artifact run (defaults to the caller repository)'
+    description: 'Owner/name of the repository that contains the artifact run and pull request (defaults to the caller repository)'
     required: false
     default: ''
 
   pr-number:
-    description: Pull request number (e.g., `github.event.pull_request.number`)
+    description: Pull request number from the GitHub event or API (e.g., `github.event.pull_request.number`), never from artifact metadata
     required: true
 
   commit-sha:
-    description: Commit SHA for unique artifact naming (e.g., `github.sha`)
+    description: Commit SHA from the GitHub event or API, never from artifact metadata; must match the source run head SHA when artifact-source-run-id is set
     required: true
 
   artifacts-to-keep:
@@ -55,7 +55,7 @@ inputs:
     default: 'true'
 
   github-token:
-    description: 'Token with `contents: write` access to the target repository (defaults to caller GITHUB_TOKEN)'
+    description: 'Token with `contents: write` access to the release repository and, for workflow-run artifacts, `actions: read` and `pull-requests: read` in the source repository (defaults to caller GITHUB_TOKEN)'
     required: false
     default: ''
 
@@ -114,10 +114,31 @@ runs:
         ARTIFACT_NAME: ${{ inputs.artifact-name }}
         ARTIFACT_FILENAME: ${{ inputs.artifact-filename }}
         ARTIFACT_SOURCE_RUN_ID: ${{ inputs.artifact-source-run-id }}
+        PR_NUMBER: ${{ inputs.pr-number }}
+        COMMIT_SHA: ${{ inputs.commit-sha }}
       run: |
         set -euo pipefail
         artifact_repo="${ARTIFACT_SOURCE_REPOSITORY:-$GITHUB_REPOSITORY}"
         run_id="$ARTIFACT_SOURCE_RUN_ID"
+
+        if ! [[ "$run_id" =~ ^[1-9][0-9]*$ && "$PR_NUMBER" =~ ^[1-9][0-9]*$ ]]; then
+          echo "artifact-source-run-id and pr-number must be positive integers" >&2
+          exit 1
+        fi
+
+        run_sha=$(gh api "/repos/$artifact_repo/actions/runs/$run_id" --jq '.head_sha')
+        if ! [[ "$run_sha" =~ ^[0-9a-f]{40}$ ]] || [ "$COMMIT_SHA" != "$run_sha" ]; then
+          echo "commit-sha does not match source run $run_id head SHA: $run_sha" >&2
+          exit 1
+        fi
+
+        # Fork runs can have an empty pull_requests list. Read the PR directly
+        # and check its current head before downloading or changing a release.
+        pr_sha=$(gh api "/repos/$artifact_repo/pulls/$PR_NUMBER" --jq '.head.sha')
+        if [ "$pr_sha" != "$run_sha" ]; then
+          echo "PR #$PR_NUMBER head SHA does not match source run $run_id head SHA: $run_sha" >&2
+          exit 1
+        fi
 
         echo "Fetching artifact '$ARTIFACT_NAME' from workflow run $run_id in $artifact_repo"
 

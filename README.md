@@ -784,7 +784,11 @@ That's `restore-button-if-removed: true` (the default). Either set it to `false`
 
 ## Migrating from older usage
 
-The common pre-v3 advanced pattern required a long custom YAML setup across two workflow files: GitHub Script for parsing artifact metadata, a Node heredoc for building the Blueprint, and a manual one-time step to publish a draft release. The reusable workflows now handle those details. If you used less-common `expose-artifact-on-public-url` inputs such as `artifact-source-repository`, `release-repository`, `create-release-if-missing`, or `cleanup-enabled`, keep using the legacy helper or wrap the reusable workflow until v3 supports those options.
+The common pre-v3 advanced pattern required a long custom YAML setup across two workflow files: GitHub Script for parsing artifact metadata, a Node heredoc for building the Blueprint, and a manual one-time step to publish a draft release. The reusable workflows now handle those details. If you used less-common `expose-artifact-on-public-url` inputs such as `artifact-source-repository`, `release-repository`, `create-release-if-missing`, or `cleanup-enabled`, use the [legacy helper with source-run checks](.github/actions/expose-artifact-on-public-url/action.yml) or wrap the reusable workflow until v3 supports those options. Update older pinned helper revisions before keeping a custom publish workflow.
+
+For legacy `workflow_run` callers, pass `artifact-source-run-id: ${{ github.event.workflow_run.id }}` and set `commit-sha` from that run's `head_sha`. Get `pr-number` from GitHub's event or API data, never from an artifact name or file. Fork runs can have an empty `workflow_run.pull_requests` list; in that case, look up the PR through the GitHub API and check that its current `head.sha` matches the source run. Do not use artifact metadata as the source of either input.
+
+The helper reads both the run and PR from `artifact-source-repository` (the caller repository by default). Before downloading or changing a release, it requires `commit-sha` and the PR's current head SHA to match the source run's head SHA. A stale run or a mismatched PR fails without uploading or pruning assets. The token must be able to read Actions runs and pull requests in the source repository. `release-repository` only selects where the release is stored.
 
 To migrate:
 
@@ -792,7 +796,7 @@ To migrate:
 2. **Replace your publish workflow.** Pick a [blueprint mode](#reusable-workflow-preview-publishymlv3): `kind:` for a single zip, `blueprint:` for fixed shapes, `blueprint-from-artifact:` for per-PR shapes. Add the `permissions:` block on both the workflow and the calling job.
 3. **One-time:** if you have an existing `ci-artifacts` draft release, either delete it (the next run creates a fresh prerelease automatically) or convert it from draft to prerelease in the Releases UI. Draft release assets require authentication, so Playground cannot download them.
 
-Older README content is preserved in git history. Use `git log -- README.md`, then check out or browse a pre-v3 commit if you need the manually orchestrated artifact pattern or the legacy `github-proxy.com` URL scheme.
+Older README content is preserved in git history, including the legacy `github-proxy.com` URL scheme. Use `git log -- README.md` for historical reference. Do not copy the pre-v3 artifact-name parsing recipe into a new publish workflow; use the source-run checks described above or migrate to the reusable workflows.
 
 ---
 

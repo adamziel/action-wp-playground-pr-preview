@@ -149,13 +149,14 @@ for (const filename of ['plugin.zip', 'build/my plugin.zip']) {
       assert.equal(readFileSync(join(workspace, 'plugin.zip'), 'utf8'), 'existing workspace zip');
       assert.equal(readFileSync(join(workspace, 'README.md'), 'utf8'), 'existing readme');
       assert.deepEqual(readdirSync(workspace).sort(), ['README.md', 'plugin.zip']);
+      const asset = `pr-17-${env.COMMIT_SHA}.zip`;
       assert.deepEqual(readFileSync(join(directory, 'upload-args'), 'utf8').trim().split('\n'), [
-        'release', 'upload', 'ci-artifacts', `${env.ARTIFACT_DIRECTORY}/pr-17-abc123.zip`,
+        'release', 'upload', 'ci-artifacts', `${env.ARTIFACT_DIRECTORY}/${asset}`,
         '--repo', 'example/releases', '--clobber',
       ]);
       const outputs = readFileSync(env.GITHUB_OUTPUT, 'utf8');
-      assert.match(outputs, /artifact-name=pr-17-abc123.zip\n/);
-      assert.match(outputs, /artifact-url=https:\/\/github.com\/example\/releases\/releases\/download\/ci-artifacts\/pr-17-abc123.zip\n/);
+      assert.ok(outputs.includes(`artifact-name=${asset}\n`));
+      assert.ok(outputs.includes(`artifact-url=https://github.com/example/releases/releases/download/ci-artifacts/${asset}\n`));
 
       assert.equal(run('Remove downloaded artifact files').status, 0);
       assert.equal(existsSync(env.ARTIFACT_DIRECTORY), false);
@@ -233,9 +234,11 @@ for (const source of ['workflow run', 'current run']) {
 
 test('legacy helper still uploads a regular file from the current run', () => {
   withLegacyArtifact([], ({ run, env }) => {
+    env.ARTIFACT_SOURCE_RUN_ID = '';
     const upload = run('Upload artifact to release');
     assert.equal(upload.status, 0, upload.stderr);
     assert.equal(readFileSync(env.TEST_UPLOAD, 'utf8'), 'existing workspace zip');
+    assert.doesNotMatch(readFileSync(env.TEST_GH_CALLS, 'utf8'), /^api /m);
   });
 });
 
@@ -243,6 +246,84 @@ test('legacy helper cleans up downloaded files even when an earlier step fails',
   assert.match(exposeArtifactAction, /- name: Remove downloaded artifact files\n\s+if: \$\{\{ always\(\) && steps.download-workflow-artifact.outputs.directory != '' \}\}/);
   assert.match(exposeArtifactAction, /ARTIFACT_DIRECTORY: \$\{\{ steps.download-workflow-artifact.outputs.directory \}\}/);
 });
+
+for (const [label, overrides, message] of [
+  ['artifact naming another PR and commit', { PR_NUMBER: '18', COMMIT_SHA: 'b'.repeat(40), TEST_PR_SHA: 'b'.repeat(40) }, /commit-sha does not match source run/],
+  ['another PR with a different head', { PR_NUMBER: '18', TEST_PR_SHA: 'b'.repeat(40) }, /PR #18 head SHA does not match/],
+  ['PR that has moved to a newer commit', { TEST_PR_SHA: 'b'.repeat(40) }, /PR #17 head SHA does not match/],
+  ['missing source run', { TEST_RUN_API_STATUS: '1' }, /Run lookup failed/],
+  ['missing PR', { TEST_PR_API_STATUS: '1' }, /PR lookup failed/],
+  ['empty run SHA', { TEST_RUN_SHA: '', COMMIT_SHA: '' }, /commit-sha does not match source run/],
+  ['null run SHA', { TEST_RUN_SHA: 'null', COMMIT_SHA: 'null', TEST_PR_SHA: 'null' }, /commit-sha does not match source run/],
+  ['malformed run SHA', { TEST_RUN_SHA: 'not-a-sha', COMMIT_SHA: 'not-a-sha', TEST_PR_SHA: 'not-a-sha' }, /commit-sha does not match source run/],
+  ['missing PR head SHA', { TEST_PR_SHA: '' }, /PR #17 head SHA does not match/],
+  ['short commit SHA', { COMMIT_SHA: 'abc123' }, /commit-sha does not match source run/],
+  ['zero PR number', { PR_NUMBER: '0' }, /must be positive integers/],
+  ['negative PR number', { PR_NUMBER: '-17' }, /must be positive integers/],
+  ['PR path instead of a number', { PR_NUMBER: '17/../../actions/runs/123' }, /must be positive integers/],
+  ['PR number with a line break', { PR_NUMBER: '17\n18' }, /must be positive integers/],
+  ['run path instead of a number', { ARTIFACT_SOURCE_RUN_ID: '123/../456' }, /must be positive integers/],
+]) {
+  test(`legacy helper rejects ${label} before changing a release`, () => {
+    withLegacyArtifact([{ name: 'plugin.zip' }], ({ run, env, workspace }) => {
+      Object.assign(env, overrides);
+      env.ARTIFACT_NAME = `plugin-build-pr${env.PR_NUMBER}-${env.COMMIT_SHA}`;
+      const result = runLegacyPublication(run);
+      assert.notEqual(result.status, 0);
+      assert.match(result.stderr, message);
+      const calls = readFileSync(env.TEST_GH_CALLS, 'utf8');
+      assert.doesNotMatch(calls, /^release /m);
+      assert.doesNotMatch(calls, /\/artifacts/);
+      assert.equal(existsSync(env.TEST_UPLOAD), false);
+      assert.deepEqual(readdirSync(env.RUNNER_TEMP), []);
+      assert.equal(readFileSync(join(workspace, 'plugin.zip'), 'utf8'), 'existing workspace zip');
+      assert.equal(readFileSync(env.GITHUB_OUTPUT, 'utf8'), '');
+    });
+  });
+}
+
+for (const repository of ['', 'example/source', 'other/builds']) {
+  test(`legacy helper verifies the source run and PR in ${repository || 'the caller repository'}`, () => {
+    withLegacyArtifact([{ name: 'plugin.zip' }], ({ run, env }) => {
+      env.ARTIFACT_SOURCE_REPOSITORY = repository;
+      const result = runLegacyPublication(run);
+      assert.equal(result.status, 0, result.stderr);
+      const sourceRepo = repository || env.GITHUB_REPOSITORY;
+      const calls = readFileSync(env.TEST_GH_CALLS, 'utf8').trim().split('\n');
+      assert.deepEqual(calls.slice(0, 2), [
+        `api /repos/${sourceRepo}/actions/runs/123 --jq .head_sha`,
+        `api /repos/${sourceRepo}/pulls/17 --jq .head.sha`,
+      ]);
+      assert.ok(calls[2].startsWith(`api /repos/${sourceRepo}/actions/runs/123/artifacts `));
+      assert.ok(calls.includes(`release upload ci-artifacts ${env.ARTIFACT_DIRECTORY}/pr-17-${env.COMMIT_SHA}.zip --repo example/releases --clobber`));
+      assert.deepEqual(calls.filter(call => call.startsWith('release delete-asset ')), [
+        'release delete-asset ci-artifacts pr-17-old.zip --repo example/releases --yes',
+      ]);
+      assert.equal(readFileSync(env.TEST_UPLOAD, 'utf8'), 'zip bytes');
+    });
+  });
+}
+
+test('legacy source checks receive the same PR and commit inputs used for upload and cleanup', () => {
+  const downloadStep = exposeArtifactAction.match(/- name: Download build artifact from workflow run[\s\S]*?(?=\n    - name:)/)?.[0];
+  assert.ok(downloadStep);
+  assert.match(downloadStep, /if: \$\{\{ inputs.artifact-source-run-id != '' \}\}/);
+  assert.match(downloadStep, /PR_NUMBER: \$\{\{ inputs.pr-number \}\}/);
+  assert.match(downloadStep, /COMMIT_SHA: \$\{\{ inputs.commit-sha \}\}/);
+});
+
+function runLegacyPublication(run) {
+  let result;
+  for (const [, name] of exposeArtifactAction.matchAll(/^    - name: (.+)$/gm)) {
+    if (![
+      'Download build artifact from workflow run', 'Ensure release exists',
+      'Upload artifact to release', 'Cleanup old artifacts for this PR',
+    ].includes(name)) continue;
+    result = run(name);
+    if (result.status !== 0) return result;
+  }
+  return result;
+}
 
 function withLegacyArtifact(entries, fn, filename = 'plugin.zip') {
   const directory = mkdtempSync(join(tmpdir(), 'legacy-artifact-'));
@@ -262,7 +343,13 @@ function withLegacyArtifact(entries, fn, filename = 'plugin.zip') {
     RELEASE_REPOSITORY: 'example/releases',
     RELEASE_TAG: 'ci-artifacts',
     PR_NUMBER: '17',
-    COMMIT_SHA: 'abc123',
+    COMMIT_SHA: 'a'.repeat(40),
+    ARTIFACTS_TO_KEEP: '1',
+    TEST_RUN_SHA: 'a'.repeat(40),
+    TEST_PR_SHA: 'a'.repeat(40),
+    TEST_RUN_API_STATUS: '0',
+    TEST_PR_API_STATUS: '0',
+    TEST_GH_CALLS: join(directory, 'gh-calls'),
     TEST_ARCHIVE: join(directory, 'fixture.zip'),
     TEST_UPLOAD: join(directory, 'uploaded.zip'),
     TEST_UPLOAD_ARGS: join(directory, 'upload-args'),
@@ -273,18 +360,41 @@ function withLegacyArtifact(entries, fn, filename = 'plugin.zip') {
       mkdirSync(path);
     }
     writeFileSync(env.GITHUB_OUTPUT, '');
+    writeFileSync(env.TEST_GH_CALLS, '');
     writeFileSync(join(workspace, 'plugin.zip'), 'existing workspace zip');
     writeFileSync(join(workspace, 'README.md'), 'existing readme');
     writeFileSync(join(directory, 'outside.zip'), 'outside bytes');
     writeFileSync(join(directory, 'bin', 'gh'), `#!/bin/bash
 set -euo pipefail
-if [[ "$*" == *"/actions/runs/"* ]]; then
+printf '%s\\n' "$*" >> "$TEST_GH_CALLS"
+if [[ "$2" == */actions/runs/*/artifacts ]]; then
   echo 456
+elif [[ "$2" == */actions/runs/* ]]; then
+  [ "$3 $4" = '--jq .head_sha' ]
+  if [ "$TEST_RUN_API_STATUS" != 0 ]; then
+    echo 'Run lookup failed' >&2
+    exit "$TEST_RUN_API_STATUS"
+  fi
+  printf '%s\\n' "$TEST_RUN_SHA"
+elif [[ "$2" == */pulls/* ]]; then
+  [ "$3 $4" = '--jq .head.sha' ]
+  if [ "$TEST_PR_API_STATUS" != 0 ]; then
+    echo 'PR lookup failed' >&2
+    exit "$TEST_PR_API_STATUS"
+  fi
+  printf '%s\\n' "$TEST_PR_SHA"
 elif [[ "$*" == *"/actions/artifacts/"* ]]; then
   cat "$TEST_ARCHIVE"
 elif [ "$1 $2" = "release upload" ]; then
   cp -- "$4" "$TEST_UPLOAD"
   printf '%s\\n' "$@" > "$TEST_UPLOAD_ARGS"
+elif [ "$1 $2" = 'release view' ]; then
+  if [ "$#" -eq 5 ]; then exit 0; fi
+  [ "$8" = '--jq' ]
+  [ "$9" = '.assets[] | select(.name | startswith("pr-'"$PR_NUMBER"'-")) | "\\(.createdAt)|\\(.name)"' ]
+  printf '%s\\n' "2026-09-12T12:00:00Z|pr-$PR_NUMBER-$COMMIT_SHA.zip" "2026-09-11T12:00:00Z|pr-$PR_NUMBER-old.zip"
+elif [ "$1 $2" = 'release delete-asset' ]; then
+  exit 0
 else
   echo "Unexpected gh call: $*" >&2
   exit 1
