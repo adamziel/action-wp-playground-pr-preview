@@ -107,6 +107,7 @@ runs:
         name: ${{ inputs.artifact-name }}
 
     - name: Download build artifact from workflow run
+      id: download-workflow-artifact
       if: ${{ inputs.artifact-source-run-id != '' }}
       shell: bash
       env:
@@ -130,19 +131,45 @@ runs:
           exit 1
         fi
 
-        download_path="$RUNNER_TEMP/${ARTIFACT_NAME}-artifact.zip"
+        export ARTIFACT_DIRECTORY
+        ARTIFACT_DIRECTORY=$(mktemp -d "$RUNNER_TEMP/playground-artifact.XXXXXX")
+        echo "directory=$ARTIFACT_DIRECTORY" >> "$GITHUB_OUTPUT"
+        download_path="$ARTIFACT_DIRECTORY/download.zip"
         echo "Downloading artifact id $artifact_id to $download_path"
         gh api -X GET \
           "/repos/$artifact_repo/actions/artifacts/$artifact_id/zip" \
           > "$download_path"
 
-        echo "Extracting artifact contents into workspace"
-        unzip -oq "$download_path" -d "$GITHUB_WORKSPACE"
+        python3 <<'PY'
+        import os
+        import shutil
+        import stat
+        from pathlib import Path, PurePosixPath
+        from zipfile import ZipFile
 
-        if [ ! -f "$ARTIFACT_FILENAME" ]; then
-          echo "Expected file '$ARTIFACT_FILENAME' not found inside artifact '$ARTIFACT_NAME'" >&2
-          exit 1
-        fi
+        directory = Path(os.environ['ARTIFACT_DIRECTORY'])
+        filename = os.environ['ARTIFACT_FILENAME']
+        with ZipFile(directory / 'download.zip') as archive:
+            # Check every entry before copying the requested file. Other archive
+            # contents are not needed for the release and must not be unpacked.
+            for entry in archive.infolist():
+                path = PurePosixPath(entry.filename)
+                if path.is_absolute() or '..' in path.parts or '\\' in entry.filename:
+                    raise SystemExit(f'Invalid artifact path: {entry.filename!r}')
+
+                file_type = stat.S_IFMT(entry.external_attr >> 16)
+                expected_type = stat.S_IFDIR if entry.is_dir() else stat.S_IFREG
+                if file_type not in (0, expected_type):
+                    raise SystemExit(f'Artifact entry must be a regular file or directory: {entry.filename!r}')
+
+            matches = [entry for entry in archive.infolist() if entry.filename == filename and not entry.is_dir()]
+            if len(matches) != 1:
+                raise SystemExit(f'Expected exactly one regular file named {filename!r} in artifact')
+
+            # Use a fixed local name rather than a path supplied by the archive.
+            with archive.open(matches[0]) as source, (directory / 'artifact.zip').open('xb') as target:
+                shutil.copyfileobj(source, target)
+        PY
 
     - name: Determine release repository
       shell: bash
@@ -187,6 +214,7 @@ runs:
       env:
         RELEASE_TAG: ${{ inputs.release-tag }}
         ARTIFACT_FILENAME: ${{ inputs.artifact-filename }}
+        ARTIFACT_DIRECTORY: ${{ steps.download-workflow-artifact.outputs.directory }}
         PR_NUMBER: ${{ inputs.pr-number }}
         COMMIT_SHA: ${{ inputs.commit-sha }}
       run: |
@@ -194,10 +222,20 @@ runs:
         release_repo="${RELEASE_REPOSITORY:-$GITHUB_REPOSITORY}"
         artifact_name="pr-${PR_NUMBER}-${COMMIT_SHA}.zip"
 
-        mv "$ARTIFACT_FILENAME" "$artifact_name"
+        artifact_path="$ARTIFACT_FILENAME"
+        if [ -n "$ARTIFACT_DIRECTORY" ]; then
+          artifact_path="$ARTIFACT_DIRECTORY/artifact.zip"
+        fi
+        if [ -L "$artifact_path" ] || [ ! -f "$artifact_path" ]; then
+          echo "Artifact must be a regular file: $artifact_path" >&2
+          exit 1
+        fi
+
+        upload_path="${ARTIFACT_DIRECTORY:-.}/$artifact_name"
+        mv -- "$artifact_path" "$upload_path"
 
         echo "Uploading $artifact_name to $RELEASE_TAG release..."
-        gh release upload "$RELEASE_TAG" "$artifact_name" \
+        gh release upload "$RELEASE_TAG" "$upload_path" \
           --repo "$release_repo" \
           --clobber
 
@@ -206,6 +244,13 @@ runs:
         echo "artifact-name=$artifact_name" >> "$GITHUB_OUTPUT"
         echo "artifact-url=$artifact_url" >> "$GITHUB_OUTPUT"
         echo "Artifact uploaded to: $artifact_url"
+
+    - name: Remove downloaded artifact files
+      if: ${{ always() && steps.download-workflow-artifact.outputs.directory != '' }}
+      shell: bash
+      env:
+        ARTIFACT_DIRECTORY: ${{ steps.download-workflow-artifact.outputs.directory }}
+      run: rm -rf -- "$ARTIFACT_DIRECTORY"
 
     - name: Cleanup old artifacts for this PR
       if: ${{ inputs.cleanup-enabled == 'true' }}
