@@ -12,7 +12,7 @@ inputs:
     default: plugin.zip
 
   artifact-source-run-id:
-    description: 'Workflow run ID that produced the artifact; when set, its head SHA and the current PR head must match commit-sha (defaults to current workflow run)'
+    description: 'Pull request workflow run ID that produced the artifact; the PR, head repository, branch, and SHA must match (defaults to current workflow run)'
     required: false
     default: ''
 
@@ -126,19 +126,52 @@ runs:
           exit 1
         fi
 
-        run_sha=$(gh api "/repos/$artifact_repo/actions/runs/$run_id" --jq '.head_sha')
-        if ! [[ "$run_sha" =~ ^[0-9a-f]{40}$ ]] || [ "$COMMIT_SHA" != "$run_sha" ]; then
-          echo "commit-sha does not match source run $run_id head SHA: $run_sha" >&2
-          exit 1
-        fi
+        export SOURCE_RUN_JSON SOURCE_PR_JSON
+        SOURCE_RUN_JSON=$(gh api "/repos/$artifact_repo/actions/runs/$run_id")
+        SOURCE_PR_JSON=$(gh api "/repos/$artifact_repo/pulls/$PR_NUMBER")
+        python3 <<'PY'
+        import json
+        import os
+        import re
+        import subprocess
 
         # Fork runs can have an empty pull_requests list. Read the PR directly
         # and check its current head before downloading or changing a release.
-        pr_sha=$(gh api "/repos/$artifact_repo/pulls/$PR_NUMBER" --jq '.head.sha')
-        if [ "$pr_sha" != "$run_sha" ]; then
-          echo "PR #$PR_NUMBER head SHA does not match source run $run_id head SHA: $run_sha" >&2
-          exit 1
-        fi
+        # A shared commit does not distinguish different forks or branches.
+        run = json.loads(os.environ['SOURCE_RUN_JSON'])
+        pr = json.loads(os.environ['SOURCE_PR_JSON'])
+        number = int(os.environ['PR_NUMBER'])
+        sha = run.get('head_sha') or ''
+        if not re.fullmatch('[0-9a-f]{40}', sha) or sha != os.environ['COMMIT_SHA']:
+            raise SystemExit('commit-sha does not match source run head SHA')
+        head = pr.get('head') or {}
+        if head.get('sha') != sha:
+            raise SystemExit(f'PR #{number} head SHA does not match source run head SHA')
+        if run.get('event') != 'pull_request':
+            raise SystemExit('Artifact source must be a pull_request run')
+        run_repo = run.get('head_repository') or {}
+        pr_repo = head.get('repo') or {}
+        if not run_repo.get('full_name') or run_repo['full_name'].lower() != (pr_repo.get('full_name') or '').lower():
+            raise SystemExit('PR head repository does not match source run')
+        if not run.get('head_branch') or run['head_branch'] != head.get('ref'):
+            raise SystemExit('PR head branch does not match source run')
+
+        pull_requests = run.get('pull_requests') or []
+        if not pull_requests:
+            # A branch can also have several PRs against different base branches.
+            # Without a run-provided PR number, only an unambiguous match is usable.
+            artifact_repo = os.environ.get('ARTIFACT_SOURCE_REPOSITORY') or os.environ['GITHUB_REPOSITORY']
+            pages = json.loads(subprocess.check_output([
+                'gh', 'api', f'/repos/{artifact_repo}/pulls', '--method', 'GET',
+                '-f', f"head={run_repo['owner']['login']}:{run['head_branch']}",
+                '-f', 'state=all', '-f', 'per_page=100', '--paginate', '--slurp',
+            ]))
+            pull_requests = [candidate for page in pages for candidate in page
+                if ((candidate.get('head') or {}).get('repo') or {}).get('full_name', '').lower() == run_repo['full_name'].lower()
+                and (candidate.get('head') or {}).get('ref') == run['head_branch']]
+        if len(pull_requests) != 1 or pull_requests[0].get('number') != number:
+            raise SystemExit(f'Source run must identify exactly PR #{number}')
+        PY
 
         echo "Fetching artifact '$ARTIFACT_NAME' from workflow run $run_id in $artifact_repo"
 
