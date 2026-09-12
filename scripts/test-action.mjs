@@ -72,8 +72,53 @@ test('description mode does not need a comment author lookup', async () => {
   assert.equal(result.calls.filter(call => call.method === 'updatePull').length, 1);
 });
 
+for (const [title, expected] of [
+  ['[x](https://example.test)', '&#91;x&#93;&#40;https&#58;&#47;&#47;example&#46;test&#41;'],
+  ['![x](https://example.test)', '&#33;&#91;x&#93;&#40;https&#58;&#47;&#47;example&#46;test&#41;'],
+  ['*bold* _italic_ ~~old~~ `code`', '&#42;bold&#42; &#95;italic&#95; &#126;&#126;old&#126;&#126; &#96;code&#96;'],
+  ['# Heading\r\n- item\n1. step\t> quote', '&#35; Heading &#45; item 1&#46; step &#62; quote'],
+  ['<img src="x"> &lt;x&gt;', '&#60;img src&#61;&#34;x&#34;&#62; &#38;lt&#59;x&#38;gt&#59;'],
+  ['https://example.test www.example.test', 'https&#58;&#47;&#47;example&#46;test www&#46;example&#46;test'],
+  ['\\[x](url)', '&#92;&#91;x&#93;&#40;url&#41;'],
+  ['    indented  ', '    indented  '],
+  ['Zażółć 😀', 'Zażółć 😀'],
+]) {
+  for (const mode of ['comment', 'append-to-description']) {
+    test(`${mode} renders the title ${JSON.stringify(title)} as text`, async () => {
+      const result = await runAction({ title, inputs: {
+        mode, 'pr-number': '7',
+        'comment-template': '**PR:** {{pr_title}}',
+        'description-template': '**PR:** {{PR_TITLE}}',
+      } });
+      assert.deepEqual(result.errors, []);
+      const posted = result.calls.find(call => call.method === (mode === 'comment' ? 'createComment' : 'updatePull'));
+      assert.ok(posted.body.includes(`**PR:** ${expected.replace(/ /g, '&#32;')}`));
+    });
+  }
+}
+
+test('branch and repository placeholders use the same text escaping', async () => {
+  const result = await runAction({ headRef: 'feature/`label`', baseRef: 'release_1', inputs: {
+    'comment-template': '{{PR_HEAD_REF}} {{PR_BASE_REF}} {{REPO_FULL_NAME}}',
+  } });
+  assert.equal(result.outputs['rendered-comment'], 'feature&#47;&#96;label&#96; release&#95;1 example&#47;plugin');
+});
+
+test('template markup, URLs, the button, and code-formatted plugin slugs keep their existing form', async () => {
+  const result = await runAction({ inputs: {
+    'plugin-path': 'plugins/my-plugin',
+    'comment-template': '**Preview** [Open]({{PLAYGROUND_URL}})\n{{PLAYGROUND_BUTTON}}\n`{{PLUGIN_SLUG}}`',
+  } });
+  assert.deepEqual(result.errors, []);
+  const rendered = result.outputs['rendered-comment'];
+  assert.ok(rendered.startsWith(`**Preview** [Open](${result.outputs['preview-url']})`));
+  assert.ok(rendered.includes(`<a href="${result.outputs['preview-url']}"`));
+  assert.match(rendered, /<img src="https:\/\/raw.githubusercontent.com\//);
+  assert.ok(rendered.endsWith('`my-plugin`'));
+});
+
 async function runAction(options = {}) {
-  const { comments = [], inputs = {}, body = '', viewerError } = options;
+  const { comments = [], inputs = {}, body = '', title = 'Add a setting', headRef = 'feature', baseRef = 'main', viewerError } = options;
   const viewerId = Object.hasOwn(options, 'viewerId') ? options.viewerId : 101;
   const calls = [];
   const outputs = {};
@@ -92,7 +137,10 @@ async function runAction(options = {}) {
         updateComment: async args => { record('updateComment', args); },
         createComment: async args => { record('createComment', args); return { data: { id: 99 } }; },
       },
-      pulls: { update: async args => { record('updatePull', args); } },
+      pulls: {
+        get: async args => { record('getPull', args); return { data: pr }; },
+        update: async args => { record('updatePull', args); },
+      },
     },
   };
   const core = {
@@ -101,9 +149,10 @@ async function runAction(options = {}) {
     setOutput: (name, value) => { outputs[name] = value; },
     setFailed: message => { errors.push(message); },
   };
+  const pr = { number: 7, title, body, head: { ref: headRef, sha: 'a'.repeat(40) }, base: { ref: baseRef } };
   const context = { payload: {
     repository: { owner: { login: 'example' }, name: 'plugin', full_name: 'example/plugin' },
-    pull_request: { number: 7, title: 'Add a setting', body, head: { ref: 'feature', sha: 'a'.repeat(40) }, base: { ref: 'main' } },
+    pull_request: inputs['pr-number'] ? undefined : pr,
   } };
   await runInNewContext(source, { require: name => {
     if (name === '@actions/core') return core;
